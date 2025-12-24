@@ -52,6 +52,15 @@ type ControllerManager = {
 	-- Internal
 	_TryLoadModule: (self: ControllerManager, ModuleScript: ModuleScript, Character: Model) -> any,
 	_InitializeControllers: (self: ControllerManager, Character: Model) -> (),
+	_SetupLifecycle: (self: ControllerManager, Character: Model) -> (),
+	_LoadModules: (self: ControllerManager, Character: Model) -> (number, number, { any }),
+	_HandleLoadResults: (
+		self: ControllerManager,
+		Character: Model,
+		TotalLoaded: number,
+		TotalModules: number,
+		FailedModules: { any }
+	) -> (),
 }
 
 -- Metatable
@@ -93,6 +102,146 @@ end
 function ControllerManager:GetController(Character: Model, Name: string): Controller?
 	local Dict = self.ControllersByCharacter[Character]
 	return if Dict then Dict[Name] else nil -- Returns the controller instance if found, otherwise nil
+end
+
+--[[
+	Main entry point: Loads all controllers for a given character.
+	Usually called when a character executes logic (e.g. CharacterAdded).
+	
+	1. Creates a Janitor for cleanup.
+	2. Recursively loads all ModuleScripts in the configured folders.
+	3. Runs the Initialization phase.
+]]
+function ControllerManager:Load(Character: Model)
+	if self.LoadingCharacters[Character] then
+		warn("Already loading controllers for " .. Character.Name)
+		return {}, {}
+	end
+
+	self.LoadingCharacters[Character] = true
+	local TotalStart = os.clock()
+
+	-- Step 1: Setup Lifecycle
+	self:_SetupLifecycle(Character)
+
+	-- Step 2: Load Modules
+	local TotalModules, TotalLoaded, FailedModules, FolderReport = self:_LoadModules(Character)
+
+	-- Step 3: Initialize Controllers
+	if TotalLoaded > 0 then
+		self:_InitializeControllers(Character)
+	end
+
+	-- Step 4: Report Results
+	self:_HandleLoadResults(Character, TotalLoaded, TotalModules, FailedModules, os.clock() - TotalStart)
+
+	self.LoadingCharacters[Character] = nil
+	return self.ControllersByCharacter[Character] or {}, FolderReport
+end
+
+--[[
+	Cleans up all controllers and logic associated with a specific character.
+	This is called automatically on death/removing, but can be called manually.
+]]
+function ControllerManager:DestroyForCharacter(Character: Model)
+	local CharJanitor = self.Janitors[Character]
+	if CharJanitor then
+		CharJanitor:Destroy() -- This destroys all controllers added to the Janitor
+		self.Janitors[Character] = nil
+	end
+	self.ControllersByCharacter[Character] = nil
+end
+
+--[[
+	Full cleanup of the Manager (e.g. when the game is shutting down or the script is destroyed).
+]]
+function ControllerManager:Destroy()
+	for _, CharJanitor in pairs(self.Janitors) do
+		CharJanitor:Destroy()
+	end
+	self.Janitors = {}
+	self.ControllersByCharacter = {}
+	self.LoadingCharacters = {}
+
+	setmetatable(self, nil)
+	table.clear(self)
+end
+
+--------------------------------------------------------------------------------
+-- INTERNAL HELPERS (Private)
+--------------------------------------------------------------------------------
+
+--[[
+	Internal: Sets up the Janitor and lifecycle events (removing/death) for a character.
+]]
+function ControllerManager:_SetupLifecycle(Character: Model)
+	-- Ensure any previous data for this character is wiped
+	self:DestroyForCharacter(Character)
+
+	-- Create lifecycle manager (Janitor) for this character
+	local CharJanitor = Janitor.new()
+	self.Janitors[Character] = CharJanitor
+
+	-- Auto-cleanup when character is removed from the game hierarchy
+	CharJanitor:Add(Character.AncestryChanged:Connect(function()
+		if not Character.Parent then
+			self:DestroyForCharacter(Character)
+		end
+	end))
+
+	-- Auto-cleanup when Humanoid dies
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+	if Humanoid then
+		CharJanitor:Add(Humanoid.Died:Connect(function()
+			self:DestroyForCharacter(Character)
+		end))
+	end
+end
+
+--[[
+	Internal: Recursively loads all modules defined in ControllerFolders.
+	Returns stats: TotalModules, TotalLoaded, FailedModules (list).
+]]
+function ControllerManager:_LoadModules(Character: Model)
+	local TotalModules = 0
+	local TotalLoaded = 0
+	local FailedModules = {}
+	local FolderReport = {}
+
+	-- Helper function to process individual modules
+	local function ProcessModule(ModuleScript: ModuleScript)
+		TotalModules += 1
+		local Entry = self:_TryLoadModule(ModuleScript, Character)
+
+		if Entry.Loaded then
+			TotalLoaded += 1
+		else
+			table.insert(FailedModules, Entry)
+		end
+
+		return Entry
+	end
+
+	-- Search the folders for ModuleScripts
+	for _, Item in ipairs(self.ControllerFolders) do
+		if typeof(Item) == "Instance" then
+			if Item:IsA("Folder") then
+				local Report = {}
+				-- Load all children modules in the folder
+				for _, Child in ipairs(Item:GetChildren()) do
+					if Child:IsA("ModuleScript") then
+						table.insert(Report, ProcessModule(Child))
+					end
+				end
+				FolderReport[Item.Name] = Report
+			elseif Item:IsA("ModuleScript") then
+				-- Load single module if passed directly
+				FolderReport[Item.Name] = { ProcessModule(Item) }
+			end
+		end
+	end
+
+	return TotalModules, TotalLoaded, FailedModules, FolderReport
 end
 
 --[[
@@ -207,91 +356,19 @@ function ControllerManager:_InitializeControllers(Character: Model)
 end
 
 --[[
-	Main entry point: Loads all controllers for a given character.
-	Usually called when a character executes logic (e.g. CharacterAdded).
-	
-	1. Creates a Janitor for cleanup.
-	2. Recursively loads all ModuleScripts in the configured folders.
-	3. Runs the Initialization phase.
+	Internal: Handles reporting and potential kicking based on load results.
 ]]
-function ControllerManager:Load(Character: Model)
-	if self.LoadingCharacters[Character] then
-		warn("Already loading controllers for " .. Character.Name)
-		return {}, {}
-	end
-
-	self.LoadingCharacters[Character] = true
-
-	-- Ensure any previous data for this character is wiped
-	self:DestroyForCharacter(Character)
-
-	-- Create lifecycle manager (Janitor) for this character
-	local CharJanitor = Janitor.new()
-	self.Janitors[Character] = CharJanitor
-
-	-- Auto-cleanup when character is removed from the game hierarchy
-	CharJanitor:Add(Character.AncestryChanged:Connect(function()
-		if not Character.Parent then
-			self:DestroyForCharacter(Character)
-		end
-	end))
-
-	-- Auto-cleanup when Humanoid dies
-	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
-	if Humanoid then
-		CharJanitor:Add(Humanoid.Died:Connect(function()
-			self:DestroyForCharacter(Character)
-		end))
-	end
-
-	local TotalStart = os.clock()
-	local FolderReport = {}
-	local TotalModules, TotalLoadedModules = 0, 0
-	local FailedModules = {}
-
-	-- Helper function to process individual modules
-	local function ProcessModule(ModuleScript: ModuleScript)
-		TotalModules += 1
-		local Entry = self:_TryLoadModule(ModuleScript, Character)
-
-		if Entry.Loaded then
-			TotalLoadedModules += 1
-		else
-			table.insert(FailedModules, Entry)
-		end
-
-		return Entry
-	end
-
-	-- Search the folders for ModuleScripts
-	for _, Item in ipairs(self.ControllerFolders) do
-		if typeof(Item) == "Instance" then
-			if Item:IsA("Folder") then
-				local Report = {}
-				-- Load all children modules in the folder
-				for _, Child in ipairs(Item:GetChildren()) do
-					if Child:IsA("ModuleScript") then
-						table.insert(Report, ProcessModule(Child))
-					end
-				end
-				FolderReport[Item.Name] = Report
-			elseif Item:IsA("ModuleScript") then
-				-- Load single module if passed directly
-				FolderReport[Item.Name] = { ProcessModule(Item) }
-			end
-		end
-	end
-
-	-- Phase 2: Initialize
-	if TotalLoadedModules > 0 then
-		self:_InitializeControllers(Character)
-	end
-
-	-- Reporting results
+function ControllerManager:_HandleLoadResults(
+	Character: Model,
+	TotalLoaded: number,
+	TotalModules: number,
+	FailedModules: { any },
+	TotalTime: number
+)
 	if #FailedModules > 0 then
-		warn(string.format("[ControllerManager] Loaded %d/%d (Failures detected)", TotalLoadedModules, TotalModules))
+		warn(string.format("[ControllerManager] Loaded %d/%d (Failures detected)", TotalLoaded, TotalModules))
 
-		-- Kick player if critical failure is detected (Production only)
+		-- Kick logic
 		local Player = Players:GetPlayerFromCharacter(Character)
 		if self.KickOnFailure and Player and not self.DevMode then
 			local ErrorList = {}
@@ -301,49 +378,17 @@ function ControllerManager:Load(Character: Model)
 			Player:Kick("Failed to load required game modules:\n" .. table.concat(ErrorList, "\n"))
 		end
 	else
-		-- Success block
 		if self.DevMode then
 			print(
 				string.format(
 					"[ControllerManager] Loaded %d/%d successfully in %.4fs",
-					TotalLoadedModules,
+					TotalLoaded,
 					TotalModules,
-					os.clock() - TotalStart
+					TotalTime
 				)
 			)
 		end
 	end
-
-	self.LoadingCharacters[Character] = nil
-	return self.ControllersByCharacter[Character] or {}, FolderReport
-end
-
---[[
-	Cleans up all controllers and logic associated with a specific character.
-	This is called automatically on death/removing, but can be called manually.
-]]
-function ControllerManager:DestroyForCharacter(Character: Model)
-	local CharJanitor = self.Janitors[Character]
-	if CharJanitor then
-		CharJanitor:Destroy() -- This destroys all controllers added to the Janitor
-		self.Janitors[Character] = nil
-	end
-	self.ControllersByCharacter[Character] = nil
-end
-
---[[
-	Full cleanup of the Manager (e.g. when the game is shutting down or the script is destroyed).
-]]
-function ControllerManager:Destroy()
-	for _, CharJanitor in pairs(self.Janitors) do
-		CharJanitor:Destroy()
-	end
-	self.Janitors = {}
-	self.ControllersByCharacter = {}
-	self.LoadingCharacters = {}
-
-	setmetatable(self, nil)
-	table.clear(self)
 end
 
 return ControllerManager

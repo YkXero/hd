@@ -1,82 +1,137 @@
---[[CHARACTER CONTROLLER MANAGER USAGE:
-
-THERE IS A TWO PHASE LOADING SYSTEM TO ENSURE ALL CONTROLLERS ARE AVAILABLE:
-
-PHASE 1 - CONSTRUCTION (.new or .New):
-	- All controller modules are required and their constructors are called
-	- Controllers are stored in the manager but should NOT reference other controllers yet
-	- Constructor signature: function Module.new(Character, Manager)
-
-PHASE 2 - INITIALIZATION (.Initialize):
-	- Called automatically after ALL controllers are constructed
-	- Here YOU USE Manager:GetController(Character, Name) to get references to other controllers
-	- Initialization signature: function Controller:Initialize()
+--[[
+	CHARACTER CONTROLLER MANAGER
+	
+	A robust two-phase loading system for modular character controllers.
+	
+	PHASE 1 - CONSTRUCTION (.new):
+		- Modules are required and constructors called.
+		- Controllers are stored in the manager but should NOT reference other controllers yet.
+	
+	PHASE 2 - INITIALIZATION (:Initialize):
+		- Called automatically after ALL controllers are constructed.
+		- Safe to use Manager:GetController() here.
 ]]
 
+-- SERVICES
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+-- PACKAGES
+local Packages = ReplicatedStorage.Packages
+local Janitor = require(Packages.Janitor)
+
+-- TYPES
+-- Definition for a Controller instance
+type Controller = {
+	Initialize: (self: Controller) -> ()?, -- Optional initialization method
+	Destroy: (self: Controller) -> ()?, -- Optional cleanup method
+	Manager: ControllerManager, -- Reference back to the manager
+	[any]: any,
+}
+
+-- Definition for the Controller Module (the ModuleScript returning a table)
+type ControllerConstructor = (Character: Model, Manager: ControllerManager) -> Controller
+
+type ControllerModule = {
+	new: ControllerConstructor?,
+	New: ControllerConstructor?,
+	RetryInterval: number?, -- Optional: Override retry time for this module
+	[any]: any,
+}
+
+-- Definition for the Manager itself
+type ControllerManager = {
+	__index: ControllerManager,
+	new: (ControllerFolders: { Folder | ModuleScript }, Options: { [string]: any }?) -> ControllerManager,
+	GetController: (self: ControllerManager, Character: Model, Name: string) -> Controller?,
+	Load: (self: ControllerManager, Character: Model) -> ({ [string]: Controller }, { [string]: any }),
+	DestroyForCharacter: (self: ControllerManager, Character: Model) -> (),
+	Destroy: (self: ControllerManager) -> (),
+
+	-- Internal
+	_TryLoadModule: (self: ControllerManager, ModuleScript: ModuleScript, Character: Model) -> any,
+	_InitializeControllers: (self: ControllerManager, Character: Model) -> (),
+}
+
+-- Metatable
 local ControllerManager = {}
 ControllerManager.__index = ControllerManager
 
--- Constructor
-function ControllerManager.new(ControllerFolders, Options)
+--[[
+	Constructor for the ControllerManager.
+	@param ControllerFolders: A list of Folders containing ModuleScripts or individual ModuleScripts to load.
+	@param Options: Configuration table { MaxRetries: number, RetryInterval: number, KickOnFailure: boolean }.
+]]
+function ControllerManager.new(ControllerFolders: { Folder | ModuleScript }, Options: { [string]: any }?)
 	local self = setmetatable({}, ControllerManager)
+
 	self.ControllerFolders = ControllerFolders or {}
+	self.LoadingCharacters = {} -- Tracks characters currently being loaded to prevent double loading
 
 	Options = Options or {}
 	self.MaxRetries = Options.MaxRetries or 5
-	self.RetryInterval = Options.RetryInterval or (60 / 5)
-	self.KickOnFailure = Options.KickOnFailure or true
+	self.RetryInterval = Options.RetryInterval or (60 / 5) -- Default: 12 seconds
+	self.KickOnFailure = if Options.KickOnFailure ~= nil then Options.KickOnFailure else true
 	self.DevMode = RunService:IsStudio()
 
-	-- Weak table to automatically clean up character entries
+	-- Storage
+	-- We use weak keys ("k") so that if the Character is destroyed/nil, the entry is automatically allowed to be garbage collected
 	self.ControllersByCharacter = setmetatable({}, { __mode = "k" })
+	self.Janitors = setmetatable({}, { __mode = "k" })
 
 	return self
 end
 
--- Get controller
-function ControllerManager:GetController(Character, Name)
+--[[
+	Retrieves a loaded controller instance for a specific character.
+	Use this inside :Initialize() methods to talk to other controllers.
+	@param Character: The character model.
+	@param Name: The name of the controller module (e.g., "MovementController").
+]]
+
+function ControllerManager:GetController(Character: Model, Name: string): Controller?
 	local Dict = self.ControllersByCharacter[Character]
-	return Dict and Dict[Name] or nil
+	return if Dict then Dict[Name] else nil -- Returns the controller instance if found, otherwise nil
 end
 
--- Attempt to load a single controller module
-function ControllerManager:_TryLoadModule(ModuleScript, Character)
+--[[
+	Internal: Attempts to require and instantiate a single controller module.
+	Handles retries if the module fails to load (e.g. waiting for dependencies).
+]]
+function ControllerManager:_TryLoadModule(ModuleScript: ModuleScript, Character: Model)
 	local Entry = {
 		Name = ModuleScript.Name,
 		Time = 0,
 		Loaded = false,
-		Error = nil,
+		Error = nil :: string?,
 		Attempts = 0,
 	}
 
 	local StartTime = os.clock()
-	local RetryInterval = self.RetryInterval
+	local CurrentRetryInterval = self.RetryInterval
 
-	print(
-		string.format(
-			"[Module: %s] Starting load (%d attempts max, %.2fs default interval)",
-			Entry.Name,
-			self.MaxRetries,
-			self.RetryInterval
-		)
-	)
+	if self.DevMode then
+		print(string.format("[Module: %s] Starting load", Entry.Name))
+	end
 
 	for Attempt = 1, self.MaxRetries do
 		Entry.Attempts = Attempt
 
-		local Success, ErrorMessage = pcall(function()
-			local Module = require(ModuleScript)
+		local Success, Result = pcall(function()
+			local Module = require(ModuleScript) :: ControllerModule
 			local Constructor = Module.New or Module.new
 
 			if type(Constructor) ~= "function" then
 				error("Missing .new() or .New() constructor")
 			end
 
-			RetryInterval = Module.RetryInterval or RetryInterval
+			-- Modules can request a custom retry interval
+			if Module.RetryInterval then
+				CurrentRetryInterval = Module.RetryInterval
+			end
 
+			-- Instantiate the controller
 			local Instance = Constructor(Character, self)
 			if not Instance then
 				error("Constructor returned nil")
@@ -84,87 +139,109 @@ function ControllerManager:_TryLoadModule(ModuleScript, Character)
 
 			Instance.Manager = self
 
-			self.ControllersByCharacter[Character] = self.ControllersByCharacter[Character] or {}
-			self.ControllersByCharacter[Character][Entry.Name] = Instance
+			-- Register the controller instance in our dictionary
+			local CharacterControllers = self.ControllersByCharacter[Character]
+			if not CharacterControllers then
+				CharacterControllers = {}
+				self.ControllersByCharacter[Character] = CharacterControllers
+			end
+			CharacterControllers[Entry.Name] = Instance
 
-			Entry.Loaded = true
+			-- If the controller has a Destroy/Cleanup method, register it with the Janitor
+			if type(Instance.Destroy) == "function" then
+				self.Janitors[Character]:Add(Instance, "Destroy")
+			end
+
+			return true
 		end)
 
-		if Success and Entry.Loaded then
-			print(string.format("[Module: %s] Loaded successfully on attempt %d", Entry.Name, Attempt))
+		-- If the module loaded successfully, mark it as loaded and break out of the loop
+		if Success then
+			Entry.Loaded = true
+			if self.DevMode then
+				print(string.format("[Module: %s] Loaded on attempt %d", Entry.Name, Attempt))
+			end
 			break
 		else
-			Entry.Error = tostring(ErrorMessage)
+			-- If the module failed to load, store the error and continue to the next attempt
+			Entry.Error = tostring(Result)
 			warn(string.format("[Module: %s] Attempt %d failed: %s", Entry.Name, Attempt, Entry.Error))
 
+			-- Wait before retrying, unless it's the last attempt
 			if Attempt < self.MaxRetries then
-				print(
-					string.format(
-						"[Module: %s] Retrying in %.2fs (%d/%d)...",
-						Entry.Name,
-						RetryInterval,
-						Attempt + 1,
-						self.MaxRetries
-					)
-				)
-				task.wait(RetryInterval)
-			else
-				warn(string.format("[Module: %s] Giving up after %d attempts", Entry.Name, self.MaxRetries))
+				task.wait(CurrentRetryInterval)
 			end
 		end
 	end
 
 	Entry.Time = os.clock() - StartTime
-	print(string.format("[Module: %s] Load time: %.4fs", Entry.Name, Entry.Time))
-
 	return Entry
 end
 
--- Initialize controllers after all are loaded
-function ControllerManager:_InitializeControllers(Character)
+--[[
+	Internal: Calls :Initialize() on all loaded controllers for a character.
+	This is the second phase of loading.
+]]
+function ControllerManager:_InitializeControllers(Character: Model)
 	local Controllers = self.ControllersByCharacter[Character]
 	if not Controllers then
 		return
 	end
 
-	print(string.format("[ControllerManager] Initializing controllers for %s...", Character.Name))
+	if self.DevMode then
+		print(string.format("[ControllerManager] Initializing for %s...", Character.Name))
+	end
 
+	-- Initialize each controller
 	for Name, Controller in pairs(Controllers) do
 		if type(Controller.Initialize) == "function" then
-			local Success, ErrorMessage = pcall(function()
+			local Success, Error = pcall(function()
 				Controller:Initialize()
 			end)
 
 			if not Success then
-				warn(string.format("[ControllerManager] Error initializing %s: %s", Name, ErrorMessage))
-			else
-				print(string.format("[ControllerManager] Initialized %s successfully", Name))
+				warn(string.format("[ControllerManager] Error initializing %s: %s", Name, tostring(Error)))
 			end
 		end
 	end
-
-	print(string.format("[ControllerManager] All controllers initialized for %s", Character.Name))
 end
 
--- Load all modules for a given character
-function ControllerManager:Load(Character)
+--[[
+	Main entry point: Loads all controllers for a given character.
+	Usually called when a character executes logic (e.g. CharacterAdded).
+	
+	1. Creates a Janitor for cleanup.
+	2. Recursively loads all ModuleScripts in the configured folders.
+	3. Runs the Initialization phase.
+]]
+function ControllerManager:Load(Character: Model)
+	if self.LoadingCharacters[Character] then
+		warn("Already loading controllers for " .. Character.Name)
+		return {}, {}
+	end
+
+	self.LoadingCharacters[Character] = true
+
+	-- Ensure any previous data for this character is wiped
 	self:DestroyForCharacter(Character)
 
-	-- Cleanup when character is removed from game
-	local AncestryConnection
-	AncestryConnection = Character.AncestryChanged:Connect(function()
+	-- Create lifecycle manager (Janitor) for this character
+	local CharJanitor = Janitor.new()
+	self.Janitors[Character] = CharJanitor
+
+	-- Auto-cleanup when character is removed from the game hierarchy
+	CharJanitor:Add(Character.AncestryChanged:Connect(function()
 		if not Character.Parent then
 			self:DestroyForCharacter(Character)
-			AncestryConnection:Disconnect()
 		end
-	end)
+	end))
 
-	-- Cleanup on character death
-	local Humanoid = Character:FindFirstChild("Humanoid")
+	-- Auto-cleanup when Humanoid dies
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
 	if Humanoid then
-		Humanoid.Died:Connect(function()
+		CharJanitor:Add(Humanoid.Died:Connect(function()
 			self:DestroyForCharacter(Character)
-		end)
+		end))
 	end
 
 	local TotalStart = os.clock()
@@ -172,155 +249,98 @@ function ControllerManager:Load(Character)
 	local TotalModules, TotalLoadedModules = 0, 0
 	local FailedModules = {}
 
+	-- Helper function to process individual modules
+	local function ProcessModule(ModuleScript: ModuleScript)
+		TotalModules += 1
+		local Entry = self:_TryLoadModule(ModuleScript, Character)
+
+		if Entry.Loaded then
+			TotalLoadedModules += 1
+		else
+			table.insert(FailedModules, Entry)
+		end
+
+		return Entry
+	end
+
+	-- Search the folders for ModuleScripts
 	for _, Item in ipairs(self.ControllerFolders) do
 		if typeof(Item) == "Instance" then
 			if Item:IsA("Folder") then
-				print(string.format("\n[Load] Folder: '%s'", Item.Name))
 				local Report = {}
-				local FolderLoadedCount = 0
-
-				for _, ModuleScript in ipairs(Item:GetChildren()) do
-					if ModuleScript:IsA("ModuleScript") then
-						TotalModules += 1
-						local Entry = self:_TryLoadModule(ModuleScript, Character)
-						table.insert(Report, Entry)
-
-						if Entry.Loaded then
-							TotalLoadedModules += 1
-							FolderLoadedCount += 1
-						else
-							table.insert(FailedModules, Entry)
-						end
+				-- Load all children modules in the folder
+				for _, Child in ipairs(Item:GetChildren()) do
+					if Child:IsA("ModuleScript") then
+						table.insert(Report, ProcessModule(Child))
 					end
 				end
-
 				FolderReport[Item.Name] = Report
-				print(string.format("[Load] -> %s: %d/%d loaded", Item.Name, FolderLoadedCount, #Report))
 			elseif Item:IsA("ModuleScript") then
-				-- Handle single ModuleScript passed in the list
-				print(string.format("\n[Load] Single Module: '%s'", Item.Name))
-				TotalModules += 1
-				local Entry = self:_TryLoadModule(Item, Character)
-
-				-- Add to a "SingleModules" report group or just use its name
-				FolderReport[Item.Name] = { Entry }
-
-				if Entry.Loaded then
-					TotalLoadedModules += 1
-					print(string.format("[Load] -> %s: Loaded", Item.Name))
-				else
-					table.insert(FailedModules, Entry)
-					print(string.format("[Load] -> %s: Failed", Item.Name))
-				end
-			else
-				warn(
-					string.format(
-						"[ControllerManager] Invalid item in ControllerFolders: %s (%s)",
-						Item.Name,
-						Item.ClassName
-					)
-				)
+				-- Load single module if passed directly
+				FolderReport[Item.Name] = { ProcessModule(Item) }
 			end
 		end
 	end
 
-	-- Initialize all controllers after loading
+	-- Phase 2: Initialize
 	if TotalLoadedModules > 0 then
 		self:_InitializeControllers(Character)
+	end
 
-		if #FailedModules > 0 then
-			warn(
+	-- Reporting results
+	if #FailedModules > 0 then
+		warn(string.format("[ControllerManager] Loaded %d/%d (Failures detected)", TotalLoadedModules, TotalModules))
+
+		-- Kick player if critical failure is detected (Production only)
+		local Player = Players:GetPlayerFromCharacter(Character)
+		if self.KickOnFailure and Player and not self.DevMode then
+			local ErrorList = {}
+			for _, Fail in ipairs(FailedModules) do
+				table.insert(ErrorList, string.format("%s: %s", Fail.Name, Fail.Error or "Unknown"))
+			end
+			Player:Kick("Failed to load required game modules:\n" .. table.concat(ErrorList, "\n"))
+		end
+	else
+		-- Success block
+		if self.DevMode then
+			print(
 				string.format(
-					"[ControllerManager] Initialized %d controllers, but %d failed to load",
+					"[ControllerManager] Loaded %d/%d successfully in %.4fs",
 					TotalLoadedModules,
-					#FailedModules
+					TotalModules,
+					os.clock() - TotalStart
 				)
 			)
 		end
 	end
 
-	-- Print summary
-	print("[SUMMARY]")
-	if #FailedModules > 0 then
-		warn(string.format("Loaded %d/%d modules (with failures)", TotalLoadedModules, TotalModules))
-		print("Failed Modules:")
-		for _, Entry in ipairs(FailedModules) do
-			print(string.format("   - %s (%s)", Entry.Name, Entry.Error or "Unknown"))
-		end
-
-		if self.KickOnFailure and not self.DevMode and Character:IsDescendantOf(game) then
-			local Player = Players:GetPlayerFromCharacter(Character)
-			if Player then
-				local Details = {}
-				for _, Entry in ipairs(FailedModules) do
-					table.insert(
-						Details,
-						string.format(
-							"%s (error: %s; attempts: %d; time: %.2fs)",
-							Entry.Name,
-							Entry.Error or "nil",
-							Entry.Attempts,
-							Entry.Time
-						)
-					)
-				end
-
-				local TotalTime = os.clock() - TotalStart
-				local Summary = string.format(
-					"[ControllerManager] Player: %s | Loaded: %d/%d | Total time: %.2fs",
-					Player.Name,
-					TotalLoadedModules,
-					TotalModules,
-					TotalTime
-				)
-
-				local KickMessage = Summary .. "\nFailed modules:\n - " .. table.concat(Details, "\n - ")
-
-				Player:Kick(KickMessage)
-			end
-		elseif self.KickOnFailure and self.DevMode then
-			warn("[ControllerManager] DevMode ON — skipping Kick")
-		end
-	else
-		print(string.format("Loaded %d/%d modules (all successful)", TotalLoadedModules, TotalModules))
-	end
-
-	print(string.format("Total load time: %.4fs\n", os.clock() - TotalStart))
+	self.LoadingCharacters[Character] = nil
 	return self.ControllersByCharacter[Character] or {}, FolderReport
 end
 
--- Destroy all controllers related to a specific character
-function ControllerManager:DestroyForCharacter(Character)
-	local Dict = self.ControllersByCharacter[Character]
-	if Dict then
-		for _, Controller in pairs(Dict) do
-			if type(Controller.Destroy) == "function" then
-				local Success, ErrorMessage = pcall(function()
-					Controller:Destroy()
-				end)
-				if not Success then
-					warn(
-						string.format("[ControllerManager] Error destroying %s: %s", tostring(Controller), ErrorMessage)
-					)
-				end
-			end
-		end
-		self.ControllersByCharacter[Character] = nil
+--[[
+	Cleans up all controllers and logic associated with a specific character.
+	This is called automatically on death/removing, but can be called manually.
+]]
+function ControllerManager:DestroyForCharacter(Character: Model)
+	local CharJanitor = self.Janitors[Character]
+	if CharJanitor then
+		CharJanitor:Destroy() -- This destroys all controllers added to the Janitor
+		self.Janitors[Character] = nil
 	end
+	self.ControllersByCharacter[Character] = nil
 end
 
--- Destroy all controllers from all characters
+--[[
+	Full cleanup of the Manager (e.g. when the game is shutting down or the script is destroyed).
+]]
 function ControllerManager:Destroy()
-	for _Character, Dict in pairs(self.ControllersByCharacter) do
-		for _, Controller in pairs(Dict) do
-			if type(Controller.Destroy) == "function" then
-				pcall(function()
-					Controller:Destroy()
-				end)
-			end
-		end
+	for _, CharJanitor in pairs(self.Janitors) do
+		CharJanitor:Destroy()
 	end
+	self.Janitors = {}
 	self.ControllersByCharacter = {}
+	self.LoadingCharacters = {}
 
 	setmetatable(self, nil)
 	table.clear(self)
